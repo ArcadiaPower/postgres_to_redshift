@@ -22,5 +22,4 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rake", "~> 10.0"
   spec.add_dependency "pg", "~> 0.20.0"
   spec.add_dependency "aws-sdk", "~> 2.10.26"
-  spec.add_dependency "pry"
 end

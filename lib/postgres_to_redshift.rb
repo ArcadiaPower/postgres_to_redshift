@@ -6,7 +6,6 @@ require 'zlib'
 require 'tempfile'
 require "postgres_to_redshift/table"
 require "postgres_to_redshift/column"
-#require 'pry'
 
 class PostgresToRedshift
   class << self
@@ -91,6 +90,7 @@ class PostgresToRedshift
 
   def copy_table(table)
     tmpfile = Tempfile.new("psql2rs")
+    tmpfile.binmode
     zip = Zlib::GzipWriter.new(tmpfile)
     chunksize = 5 * GIGABYTE # uncompressed
     chunk = 1
@@ -119,6 +119,7 @@ class PostgresToRedshift
             zip.close unless zip.closed?
             tmpfile.unlink
             tmpfile = Tempfile.new("psql2rs")
+            tmpfile.binmode
             zip = Zlib::GzipWriter.new(tmpfile)
           end
         end
