@@ -1,7 +1,7 @@
 require "postgres_to_redshift/version"
 require 'pg'
 require 'uri'
-require 'aws-sdk-v1'
+require 'aws-sdk'
 require 'zlib'
 require 'tempfile'
 require "postgres_to_redshift/table"
@@ -18,10 +18,10 @@ class PostgresToRedshift
   MEGABYTE = KILOBYTE * 1024
   GIGABYTE = MEGABYTE * 1024
 
-  def self.update_tables
+  def self.update_tables(except: [])
     update_tables = PostgresToRedshift.new
 
-    update_tables.tables.each do |table|
+    update_tables.tables(except: except).each do |table|
       target_connection.exec("CREATE TABLE IF NOT EXISTS #{schema}.#{target_connection.quote_ident(table.target_table_name)} (#{table.columns_for_create})")
 
       update_tables.copy_table(table)
@@ -67,10 +67,10 @@ class PostgresToRedshift
     self.class.target_connection
   end
 
-  def tables
+  def tables(except: [])
     source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE', 'VIEW')").map do |table_attributes|
       table = Table.new(attributes: table_attributes)
-      next if table.name =~ /^pg_/
+      next if except.include?(table.name) || table.name =~ /^pg_/
       table.columns = column_definitions(table)
       table
     end.compact
@@ -81,22 +81,32 @@ class PostgresToRedshift
   end
 
   def s3
-    @s3 ||= AWS::S3.new(access_key_id: ENV['S3_DATABASE_EXPORT_ID'], secret_access_key: ENV['S3_DATABASE_EXPORT_KEY'])
+    @s3 ||= Aws::S3::Client.new(access_key_id: ENV['S3_DATABASE_EXPORT_ID'], secret_access_key: ENV['S3_DATABASE_EXPORT_KEY'])
   end
 
   def bucket
-    @bucket ||= s3.buckets[ENV['S3_DATABASE_EXPORT_BUCKET']]
+    @bucket ||= Aws::S3::Bucket.new(ENV['S3_DATABASE_EXPORT_BUCKET'], client: s3)
   end
 
   def copy_table(table)
     tmpfile = Tempfile.new("psql2rs")
+    tmpfile.binmode
     zip = Zlib::GzipWriter.new(tmpfile)
     chunksize = 5 * GIGABYTE # uncompressed
     chunk = 1
-    bucket.objects.with_prefix("export/#{table.target_table_name}.psv.gz").delete_all
+    bucket.objects({ prefix: "export/#{table.target_table_name}.psv.gz" }).each { |object| object.delete }
+
     begin
       puts "Downloading #{table}"
       copy_command = "COPY (SELECT #{table.columns_for_copy} FROM #{table.name}) TO STDOUT WITH DELIMITER '|'"
+      key = "export/#{table.target_table_name}.psv.gz"
+      multipart_upload = s3.create_multipart_upload(bucket: bucket.name, key: key)
+
+      options = {
+        bucket: bucket.name,
+        key: key,
+        upload_id: multipart_upload.upload_id
+      }
 
       source_connection.copy_data(copy_command) do
         while row = source_connection.get_copy_data
@@ -104,34 +114,71 @@ class PostgresToRedshift
           if (zip.pos > chunksize)
             zip.finish
             tmpfile.rewind
-            upload_table(table, tmpfile, chunk)
+            upload_table(table, tmpfile, chunk, options)
             chunk += 1
             zip.close unless zip.closed?
             tmpfile.unlink
             tmpfile = Tempfile.new("psql2rs")
+            tmpfile.binmode
             zip = Zlib::GzipWriter.new(tmpfile)
           end
         end
       end
       zip.finish
       tmpfile.rewind
-      upload_table(table, tmpfile, chunk)
+      upload_table(table, tmpfile, chunk, options)
+
+      all_parts = s3.list_parts(options)
+
+      options.merge!(
+        multipart_upload: {
+          parts:
+            all_parts.parts.map do |part|
+              { part_number: part.part_number, etag: part.etag }
+            end
+        }
+      )
+
+      s3.complete_multipart_upload(options)
+
       source_connection.reset
+    rescue Aws::S3::Errors::NoSuchBucket
+      puts 'That *bucket* does not exist.'
+    rescue Aws::S3::Errors::NoSuchKey
+      puts 'That *file* does not exist.'
+    rescue Aws::S3::Errors::ServiceError => e
+      puts 'Unknown problem.'
+      puts "#{e.class}"
+      puts "#{e.message}"
+      if multipart_upload.upload_id
+        s3.abort_multipart_upload(
+          bucket: bucket.name,
+          key: key,
+          upload_id: multipart_upload.upload_id
+        )
+      end
     ensure
       zip.close unless zip.closed?
       tmpfile.unlink
     end
   end
 
-  def upload_table(table, buffer, chunk)
-    puts "Uploading #{table.target_table_name}.#{chunk}"
-    bucket.objects["export/#{table.target_table_name}.psv.gz.#{chunk}"].write(buffer, acl: :authenticated_read)
+  def upload_table(table, file, part, options)
+    puts "Uploading #{table.target_table_name}.#{part}"
+
+    s3.upload_part(
+      body:        file,
+      bucket:      options[:bucket],
+      key:         options[:key],
+      part_number: part,
+      upload_id:   options[:upload_id]
+    )
   end
 
   def import_table(table)
     puts "Importing #{table.target_table_name}"
     schema = self.class.schema
-    
+
     target_connection.exec("DROP TABLE IF EXISTS #{schema}.#{table.target_table_name}_updating")
 
     target_connection.exec("BEGIN;")
