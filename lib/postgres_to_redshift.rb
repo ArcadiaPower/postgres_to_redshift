@@ -68,7 +68,7 @@ class PostgresToRedshift
   end
 
   def tables(except: [])
-    source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE', 'VIEW')").map do |table_attributes|
+    source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE', 'VIEW') ORDER BY table_name ASC").map do |table_attributes|
       table = Table.new(attributes: table_attributes)
       next if except.include?(table.name) || table.name =~ /^pg_/
       table.columns = column_definitions(table)
